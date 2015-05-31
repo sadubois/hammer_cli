@@ -37,13 +37,14 @@ if [ ${cnt} -eq 0 ]; then
   org_id=`hammer organization list | grep " ${ORG_NAME} " | awk '{ print $1 }'`
 fi
 
+echo "Creating Organization: ${ORG_NAME}"
 cnt=`hammer user list | grep -c " rhadmin "`
 if [ ${cnt} -eq 0 ]; then
   hammer user create --organizations "${ORG_NAME}" --login ${ORG_ADMIN} --mail "${ORG_ADMIN}@${SATELLITE}" --password="${ORG_PASS}" --auth-source-id 1 --admin 1 --default-organization-id ${org_id}
 hammer organization add-user --user=${ORG_ADMIN} --name="${ORG_NAME}"
 fi
 
-# Create two new lifecycle environments  
+echo "Create lifecycle environment: DEV -> QE -> PROD"
 hammer lifecycle-environment info --name DEV --organization="${ORG_NAME}" > /dev/null 2>&1
 if [ $? -ne 0 ]; then
   hammer lifecycle-environment create --name='DEV' --prior='Library' --organization="${ORG_NAME}"
@@ -59,142 +60,96 @@ if [ $? -ne 0 ]; then
   hammer lifecycle-environment create --name='PROD' --prior='QE' --organization="${ORG_NAME}"  
 fi
 
+if [ ! -f ${MANIFEST} ]; then 
+  echo "ERROR: Manifest: ${MANIFEST} not found, aborting"; exit 0
+fi
 
+echo "Upload manifest: ${MANIFEST} (created in RH Portal)"
 # Upload our manifest.zip (created in RH Portal) to our org
 # hammer subscription list --organization "Red Hat Demo"
-cnt=`hammer subscription list --organization "${ORG_NAME}" | wc -l`
-if [ ${cnt} -eq 3 ]; then
-  hammer subscription upload --file /root/manifest.zip --organization="${ORG_NAME}"
+cnt=`hammer subscription list --organization "${ORG_NAME}" | egrep -v "Red Hat Enterprise Linux Server|---|NAME" | wc -l`
+if [ ${cnt} -eq 0 ]; then
+  hammer subscription upload --file ${MANIFEST} --organization="${ORG_NAME}"
 fi
 
-# --- CREATE PRODUCT ---
-hammer product info --name "Red Hat Enterprise Linux Server" --organization="${ORG_NAME}" > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-  hammer product create --name='Red Hat Enterprise Linux Server' --organization "${ORG_NAME}"
-fi
+# --- DUMP PRODUCTS ---
+SUBLIST=`hammer subscription list --organization "${ORG_NAME}" | awk -F'|' '{ print $8 }' | egrep -v "ID|-" | awk '{ print $1 }'`
 
+for n in $SUBLIST; do
+  hammer product list --organization "${ORG_NAME}" --subscription-id ${n} --per-page 1000 | grep -v "\--" | \
+  awk -F'|' '{ printf("%s:%s\n",$1, $2 )}' | sed -e 's/^ //g' -e 's/: /:/g' -e 's/  :/:/g' -e 's/ :/:/g' -e 's/  *$//g'  > /tmp/id_${n}
+done
 
-if [ ${REPO_RHEL6} -eq 1 ]; then 
-  # Red Hat Enterprise Linux 6 Server (Kickstart) 
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server (Kickstart)'
+# --- CREATE PRODUCTS / REPOSITORIES ---
+for ppp in `egrep "^PRODUCT" $CFGFILE | awk -F'|' '{ print $2 }' | sort | uniq | sed 's/ /_@_/g'`; do
+  prd=`echo $ppp | sed 's/_@_/ /g'`
+  pid=`egrep ":${prd}$" /tmp/id_* | head -1 | awk -F':' '{ print $2 }'`
+  mod=`grep "PRODUCT|${prd}|" $CFGFILE | awk -F'|' '{ print $3 }' | head -1`
+  echo "Creating Product: $prd ID: ${pid}"
+  hammer product info --name "$prd" --organization="${ORG_NAME}" > /dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    hammer product create --name "$prd" --organization "${ORG_NAME}"
+  fi
 
-  # Red Hat Enterprise Linux 6 Server (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server (RPMs)'
+  if [ "${mod}" = "REPOCREATE" ]; then
+    for rrr in `grep "PRODUCT|${prd}|" $CFGFILE | awk -F'|' '{ print $4 }' | sort | uniq | sed 's/ /_@_/g'`; do
+      rep=`echo $rrr | sed 's/_@_/ /g'`
 
-  # Red Hat Enterprise Linux 6 Server - Extras (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server - Extras (RPMs)'
+      echo "  adding Repository: $rep"
+      typ=`grep "PRODUCT|${prd}|REPOCREATE|${rep}|" $CFGFILE | awk -F'|' '{ print $5 }' | head -1`
+      url=`grep "PRODUCT|${prd}|REPOCREATE|${rep}|" $CFGFILE | awk -F'|' '{ print $6 }' | head -1`
 
-  # Red Hat Enterprise Linux 6 Server - Fastrack (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server - Fastrack (RPMs)'
+      if [ "${typ}" = "docker" ]; then
+        ups=`grep "PRODUCT|${prd}|REPOCREATE|${rep}|" $CFGFILE | awk -F'|' '{ print $7 }' | head -1`
+        hammer repository create --name="${rep}" --organization "${ORG_NAME}" --product="${prd}" --content-type="${typ}" --publish-via-http=true \
+          --url="${url}" --docker-upstream-name $ups  
+      fi
 
-  # Red Hat Enterprise Linux 6 Server - Optional (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server - Optional (RPMs)'
+      if [ "${typ}" = "yum" ]; then
+        hammer repository create --name="${rep}" --organization "${ORG_NAME}" --product="${prd}" --content-type="${typ}" --publish-via-http=true \
+         --url="${url}" > /dev/null 2>&1
+      fi
 
-  # Red Hat Enterprise Linux 6 Server - Optional Fastrack (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server - Optional Fastrack (RPMs)'
-
-  # Red Hat Enterprise Linux 6 Server - RH Common (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server - RH Common (RPMs)'
-
-  # Red Hat Enterprise Linux 6 Server - Supplementary (RPMs) 
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='6Server' \
-  --name 'Red Hat Enterprise Linux 6 Server - Supplementary (RPMs)'
-fi
-
-if [ ${REPO_RHEL7} -eq 1 ]; then 
-  # Red Hat Enterprise Linux 7 Server (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server (RPMs)'
-
-  # Red Hat Enterprise Linux 7 Server - Fastrack (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server - Fastrack (RPMs)'
-
-  # Red Hat Enterprise Linux 7 Server - Optional (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server - Optional (RPMs)'  
-
-  # Red Hat Enterprise Linux 7 Server - Extras (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server - Extras (RPMs)'
-
-  # Red Hat Enterprise Linux 7 Server - RH Common (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server - RH Common (RPMs)'
-
-  # Red Hat Enterprise Linux 7 Server - Optional Fastrack (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server - Optional Fastrack (RPMs)'
-
-  # Red Hat Enterprise Linux 7 Server - Supplementary (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server - Supplementary (RPMs)'
-
-  # RHN Tools for Red Hat Enterprise Linux 7 Server (RPMs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'RHN Tools for Red Hat Enterprise Linux 7 Server (RPMs)'
-
-  # Red Hat Enterprise Linux 7 Server (ISOs)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server (ISOs)'
-
-  # Red Hat Enterprise Linux 7 Server (Kickstart)
-  hammer repository-set enable --organization "${ORG_NAME}" --product 'Red Hat Enterprise Linux Server' --basearch='x86_64' --releasever='7Server' --name 'Red Hat Enterprise Linux 7 Server (Kickstart)'
-fi
-exit
-
-# --- CREATE PRODUCT ---
-hammer product create --name='EPEL' --organization "${ORG_NAME}"
-
-if [ ${REPO_EPEL6} -eq 1 ]; then 
-  hammer repository create --name='EPEL 6 - x86_64' --organization "${ORG_NAME}" --product='EPEL' --content-type='yum' --publish-via-http=true --url=http://dl.fedoraproject.org/pub/epel/6/x86_64/
-fi
-
-if [ ${REPO_EPEL7} -eq 1 ]; then 
-  hammer repository create --name='EPEL 7 - x86_64' --organization "${ORG_NAME}" --product='EPEL' --content-type='yum' --publish-via-http=true --url=http://dl.fedoraproject.org/pub/epel/7/x86_64/
-fi
-
-
-# --- CREATE PUPPET FORGE ---
-hammer product create --name='Forge' --organization "${ORG_NAME}"
-
-hammer repository create --name='Puppet Forge' --organization "${ORG_NAME}" --product='Forge' --content-type='puppet' --publish-via-http=true --url=https://forge.puppetlabs.com
-
-# --- CREATE CONTENT VIEW ---
-if [ ${REPO_RHEL6} -eq 1 ]; then 
-  hammer content-view create --name='rhel-6-server-x86_64-cv' --organization "${ORG_NAME}"
-
-  for n in $(hammer --csv repository list --organization "${ORG_NAME}" | grep "Linux 6 Server" | awk -F, {'print $1'} | grep -vi '^ID'); do
-    hammer content-view add-repository --name rhel-6-server-x86_64-cv --organization "${ORG_NAME}" --repository-id ${n};
-  done
-
-  if [ ${REPO_EPEL6} -eq 1 ]; then 
-    for n in $(hammer --csv repository list --organization "${ORG_NAME}" | grep "EPEL 6" | awk -F, {'print $1'} | grep -vi '^ID'); do
-      hammer content-view add-repository --name rhel-6-server-x86_64-cv --organization "${ORG_NAME}" --repository-id ${n};
+      if [ "${typ}" = "puppet" ]; then
+        hammer repository create --name="${rep}" --organization "${ORG_NAME}" --product="${prd}" --content-type="${typ}" --publish-via-http=true \
+         --url="${url}" > /dev/null 2>&1
+      fi
     done
   fi
-fi
 
-# --- CREATE CONTENT VIEW ---
-if [ ${REPO_RHEL7} -eq 1 ]; then
-  hammer content-view create --name='rhel-7-server-x86_64-cv' --organization "${ORG_NAME}"
+  if [ "${mod}" = "REPOSET1" ]; then
+    for rrr in `grep "PRODUCT|${prd}|" $CFGFILE | awk -F'|' '{ print $4 }' | sort | uniq | sed 's/ /_@_/g'`; do
+      rep=`echo $rrr | sed 's/_@_/ /g'`
 
-  for n in $(hammer --csv repository list --organization "${ORG_NAME}" --content-type yum | grep "Linux 7 Server" | awk -F, {'print $1'} | grep -vi '^ID'); do
-    hammer content-view add-repository --name rhel-7-server-x86_64-cv --organization "${ORG_NAME}" --repository-id ${n};
-  done
+      echo "  adding Repository: $rep"
+      arc=`grep "PRODUCT|${prd}|REPOSET|${rep}|" $CFGFILE | awk -F'|' '{ print $5 }' | head -1`
+      typ=`grep "PRODUCT|${prd}|REPOSET|${rep}|" $CFGFILE | awk -F'|' '{ print $6 }' | head -1`
 
-  if [ ${REPO_EPEL6} -eq 1 ]; then
-    for n in $(hammer --csv repository list --organization "${ORG_NAME}" --content-type yum | grep "EPEL 7" | awk -F, {'print $1'} | grep -vi '^ID'); do
-      hammer content-view add-repository --name rhel-7-server-x86_64-cv --organization "${ORG_NAME}" --repository-id ${n};
+      hammer repository-set enable --organization "${ORG_NAME}" --product-id $pid  --basearch="${arc}" --releasever="${typ}" --name "${rep}" > /dev/null 2>&1
     done
   fi
-fi
+done
 
-exit
+# --- CREATE CONTENT VIEW ---
+for ccc in `egrep "^CV" $CFGFILE | awk -F'|' '{ print $2 }' | sort | uniq | sed 's/ /_@_/g'`; do
+  ctv=`echo $ccc | sed 's/_@_/ /g'`
+  echo "Creating ContentView: $ctv"
+  hammer content-view info --name "${ctv}" --organization="${ORG_NAME}" > /dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    hammer content-view create --name "${ctv}" --organization "${ORG_NAME}" > /dev/null 2>&1
+  fi
 
-#for i in $(hammer --csv repository list --organization "${ORG_NAME}" | awk -F, {'print $1'} | grep -vi '^ID'); do 
-#  hammer content-view add-repository --name='rhel-7-server-x86_64-cv' --organization "${ORG_NAME}" --repository-id=${i}; 
-#done
+  for ppp in `egrep "^CV" $CFGFILE | awk -F'|' '{ print $3 }' | sort | uniq | sed 's/ /_@_/g'`; do
+    prd=`echo $ppp | sed 's/_@_/ /g'`
+    str=`grep "CV|${ctv}|${prd}|" $CFGFILE | awk -F'|' '{ print $4 }' | head -1`
+    echo "  adding Repository: $prd (${str})"
+    for n in $(hammer --csv repository list --organization "${ORG_NAME}" --product "${prd}" | \
+      egrep "${str}" | awk -F, {'print $1'} | grep -vi '^ID'); do
 
-
+      hammer content-view add-repository --name "${ctv}" --organization "${ORG_NAME}" --repository-id ${n} > /dev/null 2>&1
+    done
+  done
+done
 
 # --- CREATE HOST-GROUP ---
 # hammer hostgroup create --help
